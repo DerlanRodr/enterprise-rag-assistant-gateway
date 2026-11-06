@@ -1,12 +1,12 @@
 """
-Módulo de Guardrails Anti-Alucinação (Ground Truth Verification).
-Garante que o assistente responda EXCLUSIVAMENTE com base em documentos oficiais auditados,
-eliminando alucinações de modelos generativos em ambientes corporativos críticos.
+Módulo de Guardrails Anti-Alucinação e Resposta Adaptativa por Papel (Role-Based Personas).
+Garante respostas estritamente baseadas na base de conhecimento oficial (Ground Truth)
+e adapta o nível de detalhe (Analista, Gestor, Operacional).
 """
 from typing import List, Dict, Any, Optional
 import logging
 from src.core.config import settings
-from src.core.security import sanitizar_texto_lgpd
+from src.core.security import sanitizar_texto_lgpd, RecipientRole
 from src.rag.vector_store import DocumentChunk
 
 logger = logging.getLogger(__name__)
@@ -14,40 +14,56 @@ logger = logging.getLogger(__name__)
 
 class AntiHallucinationGuard:
     """
-    Camada de proteção e verificação factual (Ground Truth).
-    Impede que o assistente responda a perguntas fora do escopo ou invente diretrizes.
+    Camada de proteção, verificação factual e síntese adaptativa por perfil corporativo.
     """
-    FALLBACK_REJECTION_MESSAGE: str = (
-        "Informação não localizada na base de conhecimento corporativa oficial. "
-        "Para preservar a integridade dos dados e prevenir alucinações, "
-        "consulte o setor responsável ou a documentação homologada."
-    )
+
+    @classmethod
+    def get_fallback_message(cls, role: RecipientRole) -> str:
+        """Mensagem padronizada quando a documentação não responde à pergunta."""
+        if role == RecipientRole.ANALYST:
+            return (
+                "A informação técnica solicitada não foi localizada na base de conhecimento oficial. "
+                "O responsável técnico analisará a solicitação e retornará diretamente."
+            )
+        elif role == RecipientRole.MANAGER:
+            return (
+                "A documentação homologada não esclarece esta solicitação no momento. "
+                "Esta resposta é baseada estritamente nas diretrizes vigentes e respeita a LGPD. "
+                "Favor aguardar o retorno direto do responsável."
+            )
+        else:  # OPERATIONAL / Demais
+            return (
+                "A informação solicitada não consta na documentação oficial homologada. "
+                "Para prosseguir com sua solicitação, favor abrir um chamado no sistema de "
+                "atendimento corporativo ou contatar o responsável técnico."
+            )
 
     @classmethod
     def verify_and_synthesize(
         cls,
         query: str,
         retrieved_chunks: List[DocumentChunk],
+        role: RecipientRole = RecipientRole.OPERATIONAL,
         strict: Optional[bool] = None
     ) -> Dict[str, Any]:
         """
-        Valida a relevância dos fragmentos recuperados.
-        Caso nenhum fragmento atinja o limiar de similaridade, bloqueia a resposta generativa.
+        Valida os fragmentos recuperados e formata a resposta no nível de detalhe
+        apropriado para o papel do destinatário.
         """
         is_strict = strict if strict is not None else settings.strict_ground_truth
 
         # 1. Checagem de disponibilidade de chunks
         if not retrieved_chunks:
-            logger.info("Guardrail ativado: nenhum fragmento relevante recuperado. Bloqueando resposta.")
+            logger.info(f"Guardrail ativado: nenhum chunk recuperado para perfil {role.value}.")
             return {
                 "grounded": False,
-                "answer": cls.FALLBACK_REJECTION_MESSAGE,
+                "answer": cls.get_fallback_message(role),
                 "sources": [],
                 "confidence_score": 0.0,
+                "role_applied": role.value,
                 "guardrail_status": "REJECTED_LOW_SIMILARITY"
             }
 
-        # 2. Avaliação de pontuação do chunk primário
         top_chunk = retrieved_chunks[0]
         confidence = top_chunk.similarity
 
@@ -57,62 +73,53 @@ class AntiHallucinationGuard:
             )
             return {
                 "grounded": False,
-                "answer": cls.FALLBACK_REJECTION_MESSAGE,
+                "answer": cls.get_fallback_message(role),
                 "sources": [top_chunk.source],
                 "confidence_score": confidence,
+                "role_applied": role.value,
                 "guardrail_status": "REJECTED_THRESHOLD_UNMET"
             }
 
-        # 3. Síntese factual auditável (Grounded Response)
-        # Monta a resposta estritamente lastreada nos trechos oficiais
-        resumo_trechos = []
-        fontes_usadas = []
+        # 2. Formatação da resposta conforme o papel do destinatário
+        fontes_usadas = list(set(c.source for c in retrieved_chunks))
+        
+        if role == RecipientRole.ANALYST:
+            # Perfil Analista: Detalhes técnicos, regras, tabelas e integridade
+            detalhes = []
+            for c in retrieved_chunks:
+                detalhes.append(f"### [{c.title}]\n{c.content}")
+            corpo = (
+                "**[Detalhamento Técnico Documentado]**\n\n"
+                + "\n\n".join(detalhes)
+                + f"\n\n*Fontes auditadas: {', '.join(fontes_usadas)}*"
+            )
+        elif role == RecipientRole.MANAGER:
+            # Perfil Gestor: Resumo executivo, impacto de negócio, sem jargões desnecessários
+            resumos = [f"• **{c.title}**: {c.content.splitlines()[0]}" for c in retrieved_chunks]
+            corpo = (
+                "Olá. Com base exclusivamente na documentação corporativa homologada "
+                "(autorizado pelo responsável e em conformidade com a LGPD):\n\n"
+                + "\n\n".join(resumos)
+                + "\n\n*Caso necessite de encaminhamento complementar, o responsável permanece à disposição.*"
+            )
+        else:
+            # Perfil Operacional / Colaboradores: Prático, orientativo, sem jargões
+            passos = [f"• **{c.title}**:\n{c.content}" for c in retrieved_chunks]
+            corpo = (
+                "Informações encontradas na documentação oficial:\n\n"
+                + "\n\n".join(passos)
+                + "\n\n*Em caso de dúvidas sobre exceções, registre um chamado no sistema corporativo de atendimento.*"
+            )
 
-        for c in retrieved_chunks:
-            fontes_usadas.append(f"{c.source} :: {c.title}")
-            resumo_trechos.append(f"• **{c.title}**:\n{c.content}")
-
-        corpo_resposta = (
-            f"Com base na base de conhecimento corporativa oficial:\n\n"
-            + "\n\n".join(resumo_trechos)
-            + f"\n\n*Fontes auditadas: {', '.join(set(c.source for c in retrieved_chunks))}*"
-        )
-
-        # Higienização de dados na saída (LGPD by Design)
-        resposta_higienizada = sanitizar_texto_lgpd(corpo_resposta)
+        # Higienização de dados sensíveis na saída
+        resposta_higienizada = sanitizar_texto_lgpd(corpo)
 
         return {
             "grounded": True,
             "answer": resposta_higienizada,
-            "sources": list(set(fontes_usadas)),
+            "sources": [f"{c.source} :: {c.title}" for c in retrieved_chunks],
             "confidence_score": confidence,
+            "role_applied": role.value,
             "guardrail_status": "APPROVED"
         }
 
-    @classmethod
-    def build_llm_prompt(cls, query: str, chunks: List[DocumentChunk]) -> Dict[str, str]:
-        """
-        Gera os prompts de Sistema e Usuário com restrição estrita de alucinação
-        para interoperabilidade com LLMs (Gemini, Claude, GPT).
-        """
-        context_str = "\n\n---\n\n".join([f"FONTE: {c.source} | SEÇÃO: {c.title}\n{c.content}" for c in chunks])
-        
-        system_instruction = (
-            "Você é um Assistente Corporativo estritamente factual.\n"
-            "Diretrizes inegociáveis:\n"
-            "1. Responda SOMENTE e EXCLUSIVAMENTE com base no contexto fornecido.\n"
-            "2. Nunca invente regras, políticas ou exceções não descritas no texto.\n"
-            f"3. Se a informação não constar explicitamente no contexto, responda exatamente: '{cls.FALLBACK_REJECTION_MESSAGE}'\n"
-            "4. Não mencione conjecturas ou opiniões externas."
-        )
-
-        user_prompt = (
-            f"CONTEXTO OFICIAL:\n{context_str}\n\n"
-            f"PERGUNTA DO COLABORADOR:\n{query}\n\n"
-            "RESPOSTA FACTUAL:"
-        )
-
-        return {
-            "system_instruction": system_instruction,
-            "user_prompt": user_prompt
-        }

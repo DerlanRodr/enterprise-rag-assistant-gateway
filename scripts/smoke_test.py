@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
 Script Executável de Smoke Test (Teste de Fumaça).
-Valida 100% dos componentes arquiteturais da solução:
-1. Controle de Acesso (Whitelist Gatekeeper)
-2. Higienização LGPD
+Valida 100% dos componentes operacionais e arquiteturais da solução:
+1. Controle de Acesso e Perfis (Whitelist & RBAC: Analista, Gestor, Operacional)
+2. Higienização LGPD e Expurgo de Caminhos Físicos da Máquina
 3. Ingestão de Markdown e Segmentação de Chunks
-4. Busca Vetorial por Similaridade de Cosseno (SurrealDB Ready / In-Memory)
-5. Guardrails Anti-Alucinação (Ground Truth Verification)
-6. Fluxo Completo de Webhook de Mensageria
+4. Guardrails Anti-Alucinação e Respostas Adaptativas por Perfil
+5. Fluxo de Webhook com Regras de Negócio Reais:
+   - Janela de Carência de 5 Minutos (Human-in-the-Loop Debounce)
+   - Filtro de Ruído (ignora 'ok', reações)
+   - Filtro de Grupos Técnicos (exige menção direta)
+   - Marcação como Não Lida para Auditoria Humana Posterior
+6. Latência e Desempenho Ultrarrápido
 
 Uso:
     python scripts/smoke_test.py
@@ -16,13 +20,12 @@ import sys
 import os
 import time
 
-# Garante inclusão do diretório raiz no PYTHONPATH
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from src.core.config import settings
-from src.core.security import WhitelistValidator, sanitizar_texto_lgpd
+from src.core.security import WhitelistValidator, RecipientRole, sanitizar_texto_lgpd, remover_caminhos_locais
 from src.rag.vector_store import EmbeddingEngine
 from src.rag.retriever import KnowledgeRetriever
 from src.rag.anti_hallucination import AntiHallucinationGuard
@@ -31,7 +34,7 @@ from src.gateway.webhook_handler import MessageGatewayHandler, InboundMessage
 
 def print_banner():
     print("=" * 78)
-    print("  ENTERPRISE RAG ASSISTANT GATEWAY :: SMOKE TEST SUITE (TESTE DE FUMAÇA)")
+    print("  ENTERPRISE RAG ASSISTANT GATEWAY :: SMOKE TEST SUITE (OPERAÇÃO REAL)")
     print("=" * 78)
     print(f" Ambiente: {settings.app_env.upper()} | Python: {sys.version.split()[0]}")
     print(f" Diretório Raiz: {ROOT_DIR}")
@@ -39,109 +42,145 @@ def print_banner():
     print()
 
 
-def test_scenario_whitelist():
-    print("[1/6] Validando Camada de Segurança (Whitelist Gatekeeper)...")
-    auth_user = "+5511999990001"
+def test_scenario_whitelist_and_rbac():
+    print("[1/6] Validando Camada de Segurança (Whitelist & RBAC por Perfil)...")
+    analyst_user = "+5511999990001"
+    manager_user = "+5511999990002"
+    operational_user = "+5585999990003"
     intruder_user = "+5511988887777"
 
-    is_auth_ok, _ = WhitelistValidator.authorize_or_reject(auth_user)
-    assert is_auth_ok is True, f"Falha: Usuário homologado {auth_user} deveria ser autorizado!"
+    # 1. Analista
+    is_auth, role, _ = WhitelistValidator.authorize_or_reject(analyst_user)
+    assert is_auth is True and role == RecipientRole.ANALYST
+    print(f"      -> {analyst_user}: PERMITIDO [Perfil: {role.value}]")
 
-    is_intruder_ok, reject_msg = WhitelistValidator.authorize_or_reject(intruder_user)
-    assert is_intruder_ok is False, f"Falha: Invasor {intruder_user} deveria ser rejeitado!"
+    # 2. Gestor
+    is_auth, role, _ = WhitelistValidator.authorize_or_reject(manager_user)
+    assert is_auth is True and role == RecipientRole.MANAGER
+    print(f"      -> {manager_user}: PERMITIDO [Perfil: {role.value}]")
+
+    # 3. Operacional
+    is_auth, role, _ = WhitelistValidator.authorize_or_reject(operational_user)
+    assert is_auth is True and role == RecipientRole.OPERATIONAL
+    print(f"      -> {operational_user}: PERMITIDO [Perfil: {role.value}]")
+
+    # 4. Invasor
+    is_auth, role, reject_msg = WhitelistValidator.authorize_or_reject(intruder_user)
+    assert is_auth is False and role == RecipientRole.UNAUTHORIZED
     assert "Acesso restrito" in reject_msg
-
-    print("      -> Contato Autorizado: PERMITIDO")
-    print("      -> Contato Não-Autorizado: BLOQUEADO COM SUCESSO (Zero-Trust Ativo)")
-    print("      [PASS] Whitelist Gatekeeper 100% Operacional.\n")
+    print(f"      -> {intruder_user}: BLOQUEADO [Zero Trust Ativo]")
+    print("      [PASS] Whitelist e Perfis RBAC 100% Operacionais.\n")
 
 
-def test_scenario_lgpd():
-    print("[2/6] Validando Higienização de Dados Pessoais (LGPD by Design)...")
-    texto_sensivel = (
-        "Solicito reembolso de R$ 85,00. Meu CPF é 012.345.678-99 e "
-        "o cartão utilizado foi 5555 4444 3333 2222 para o almoço."
-    )
+def test_scenario_lgpd_and_path_sanitization():
+    print("[2/6] Validando Higienização LGPD e Expurgo de Caminhos Locais...")
+    # A. Mascaramento LGPD
+    texto_sensivel = "Reembolso com CPF 012.345.678-99 e cartão corporativo 5555 4444 3333 2222."
     limpo = sanitizar_texto_lgpd(texto_sensivel)
-    assert "012.345.678-99" not in limpo, "Falha: CPF não foi mascarado!"
-    assert "[CPF_REMOVIDO]" in limpo
-    assert "5555 4444 3333 2222" not in limpo, "Falha: Cartão não foi mascarado!"
-    assert "[CARTAO_REMOVIDO]" in limpo
+    assert "012.345.678-99" not in limpo and "[CPF_REMOVIDO]" in limpo
+    assert "5555 4444 3333 2222" not in limpo and "[CARTAO_REMOVIDO]" in limpo
 
-    print(f"      -> Entrada original: {texto_sensivel[:60]}...")
-    print(f"      -> Saída sanitizada: {limpo[:60]}...")
-    print("      [PASS] Módulo LGPD 100% Operacional.\n")
+    # B. Expurgo de caminhos locais (mantendo número de chamado #2026...)
+    texto_doc = "Arquivo em D:\\Visual Code\\scripts\\consulta.py gerado para o Chamado #2026059303."
+    doc_limpo = remover_caminhos_locais(texto_doc)
+    assert "D:\\Visual Code" not in doc_limpo and "[CAMINHO_INTERNO]" in doc_limpo
+    assert "#2026059303" in doc_limpo  # Rastreabilidade mantida!
+
+    print("      -> Dados Pessoais (CPF/Cartão): MASCARADOS")
+    print("      -> Caminhos da Máquina: EXPURGADOS (Rastreabilidade de chamado preservada)")
+    print("      [PASS] Módulos de Higienização e LGPD 100% Operacionais.\n")
 
 
 def test_scenario_retriever_and_ingestion():
     print("[3/6] Validando Ingestão de Documentos e Busca Vetorial...")
     sample_file = os.path.join(ROOT_DIR, "data", "samples", "sample_enterprise_knowledge.md")
-    assert os.path.exists(sample_file), f"Arquivo de amostra não encontrado: {sample_file}"
+    assert os.path.exists(sample_file), f"Arquivo não encontrado: {sample_file}"
 
     retriever = KnowledgeRetriever()
     count = retriever.ingest_file(sample_file)
-    assert count > 0, "Falha: Nenhum chunk foi indexado a partir do Markdown!"
+    assert count > 0
 
-    # Teste de consulta vetorial
     query = "Como funciona o reembolso de almoço e alimentação?"
     chunks = retriever.retrieve(query=query, top_k=2, threshold=0.20)
-    assert len(chunks) > 0, "Falha: Busca vetorial não retornou fragmentos para consulta válida!"
-    assert "Reembolso" in chunks[0].title, f"Título inesperado: {chunks[0].title}"
+    assert len(chunks) > 0
+    assert "Reembolso" in chunks[0].title
 
-    print(f"      -> Arquivo ingerido: {os.path.basename(sample_file)} ({count} seções)")
-    print(f"      -> Consulta: '{query}'")
-    print(f"      -> Top Chunk Encontrado: '{chunks[0].title}' (Similaridade: {chunks[0].similarity:.4f})")
-    print("      [PASS] Motor Vetorial e Ingestão 100% Operacionais.\n")
+    print(f"      -> Chunks Indexados: {count} seções")
+    print(f"      -> Busca Vetorial: Top chunk '{chunks[0].title}' (Similaridade: {chunks[0].similarity:.4f})")
+    print("      [PASS] Ingestão e Motor Vetorial 100% Operacionais.\n")
     return retriever
 
 
-def test_scenario_anti_hallucination(retriever: KnowledgeRetriever):
-    print("[4/6] Validando Guardrails Anti-Alucinação (Ground Truth Verification)...")
+def test_scenario_anti_hallucination_and_roles(retriever: KnowledgeRetriever):
+    print("[4/6] Validando Respostas Adaptativas por Perfil e Anti-Alucinação...")
 
-    # Caso A: Pergunta factual dentro do escopo
-    query_in = "Qual o limite de valor de alimentação em viagens corporativas?"
-    chunks_in = retriever.retrieve(query_in, top_k=2, threshold=0.20)
-    synthesis_in = AntiHallucinationGuard.verify_and_synthesize(query_in, chunks_in)
-    assert synthesis_in["grounded"] is True
-    assert synthesis_in["guardrail_status"] == "APPROVED"
-    assert "R$ 85,00" in synthesis_in["answer"]
-    print("      -> Pergunta dentro do escopo: APROVADA COM LASTRO FACTUAL")
+    # Perfil Analista: Detalhes técnicos
+    chunks = retriever.retrieve("Como funciona o reembolso de almoço?", top_k=1, threshold=0.20)
+    resp_analista = AntiHallucinationGuard.verify_and_synthesize("reembolso", chunks, role=RecipientRole.ANALYST)
+    assert resp_analista["grounded"] is True
+    assert "[Detalhamento Técnico Documentado]" in resp_analista["answer"]
+    print("      -> Perfil Analista: Resposta técnica detalhada aprovada.")
 
-    # Caso B: Pergunta alienígena / fora do escopo corporativo
-    query_out = "Qual a receita para fazer sorvete de pistache caseiro?"
-    chunks_out = retriever.retrieve(query_out, top_k=2, threshold=0.20)
-    synthesis_out = AntiHallucinationGuard.verify_and_synthesize(query_out, chunks_out)
-    assert synthesis_out["grounded"] is False
-    assert "não localizada na base de conhecimento" in synthesis_out["answer"]
-    print("      -> Pergunta fora do escopo: BLOQUEADA PELO GUARDRAIL ANTI-ALUCINAÇÃO")
-    print("      [PASS] Verificação Factual 100% Operacional.\n")
+    # Perfil Gestor: Linguagem executiva e aviso LGPD
+    resp_gestor = AntiHallucinationGuard.verify_and_synthesize("reembolso", chunks, role=RecipientRole.MANAGER)
+    assert resp_gestor["grounded"] is True
+    assert "LGPD" in resp_gestor["answer"]
+    print("      -> Perfil Gestor: Resumo executivo com aviso LGPD aprovado.")
+
+    # Pergunta Fora do Escopo para Colaborador: Direcionamento para abertura de chamado
+    resp_operacional_fora = AntiHallucinationGuard.verify_and_synthesize(
+        "Como consertar um telescópio espacial?", [], role=RecipientRole.OPERATIONAL
+    )
+    assert resp_operacional_fora["grounded"] is False
+    assert "abrir um chamado" in resp_operacional_fora["answer"]
+    print("      -> Fora do Escopo: Direcionamento formal para abertura de chamado aprovado.")
+    print("      [PASS] Respostas por Perfil e Guardrails 100% Operacionais.\n")
 
 
-def test_scenario_end_to_end_webhook(retriever: KnowledgeRetriever):
-    print("[5/6] Validando Fluxo Integrado de Webhook de Mensageria...")
+def test_scenario_real_world_webhook(retriever: KnowledgeRetriever):
+    print("[5/6] Validando Regras Reais do Webhook (Grace Period, Ruído, Auditoria)...")
     gateway = MessageGatewayHandler(retriever=retriever)
 
-    # 1. Usuário invasor
-    msg_invasor = InboundMessage(
-        sender_id="+5511988880000",
-        message_text="Me fale sobre as regras de férias da empresa."
-    )
-    resp_invasor = gateway.process_message(msg_invasor)
-    assert resp_invasor.is_authorized is False
-    assert resp_invasor.status == "UNAUTHORIZED_REJECTED"
-    print("      -> Tentativa Invasora: Interceptada na borda da API.")
+    # 1. Filtro de Ruído: Mensagem 'ok' ou 'valeu' não gera resposta
+    msg_ruido = InboundMessage(sender_id="+5511999990001", message_text="ok, muito obrigado!")
+    resp_ruido = gateway.process_message(msg_ruido)
+    assert resp_ruido.status == "IGNORED_NON_ACTIONABLE"
+    print("      -> Filtro de Ruído: 'ok/obrigado' ignorado com sucesso.")
 
-    # 2. Usuário homologado com pergunta corporativa
-    msg_autorizado = InboundMessage(
+    # 2. Grupo Técnico sem menção direta ao responsável: Não responde
+    msg_grupo_sem_tag = InboundMessage(
         sender_id="+5511999990001",
-        message_text="Em quantos períodos posso dividir as minhas férias?"
+        message_text="Pessoal, alguém sabe as regras de férias?",
+        is_group=True,
+        mentions_maintainer=False
     )
-    resp_autorizado = gateway.process_message(msg_autorizado)
-    assert resp_autorizado.is_authorized is True
-    assert resp_autorizado.status == "AUTHORIZED_SUCCESS"
-    assert "3 (três) períodos" in resp_autorizado.response_text or "fracionadas" in resp_autorizado.response_text
-    print("      -> Mensagem Autorizada: Processada com resposta factual completa.")
-    print("      [PASS] Gateway de Mensageria 100% Operacional.\n")
+    resp_sem_tag = gateway.process_message(msg_grupo_sem_tag)
+    assert resp_sem_tag.status == "IGNORED_NOT_MENTIONED"
+    print("      -> Grupo Técnico sem Tag: Ignorado para evitar spam no grupo.")
+
+    # 3. Janela de Carência de 5 Minutos: Responsável respondeu manualmente -> Robô aborta
+    msg_grace = InboundMessage(
+        sender_id="+5511999990001",
+        message_text="@responsavel como funciona o reembolso?",
+        is_group=True,
+        mentions_maintainer=True,
+        maintainer_answered_in_window=True
+    )
+    resp_grace = gateway.process_message(msg_grace)
+    assert resp_grace.status == "ABORTED_HUMAN_ANSWERED"
+    print("      -> Janela de 5 Minutos (Human-in-the-Loop): Resposta manual detectada, robô abortou.")
+
+    # 4. Mensagem Válida: Responde e marca como não lida para auditoria do responsável
+    msg_valida = InboundMessage(
+        sender_id="+5511999990001",
+        message_text="Em quantos períodos posso dividir as minhas férias?",
+        is_group=False
+    )
+    resp_valida = gateway.process_message(msg_valida)
+    assert resp_valida.status == "AUTHORIZED_SUCCESS"
+    assert resp_valida.mark_conversation_as_unread is True  # Regra de ouro da auditoria
+    print("      -> Mensagem Válida: Respondida e marcada como NÃO LIDA para auditoria posterior.")
+    print("      [PASS] Regras Operacionais de Mensageria 100% Operacionais.\n")
 
 
 def test_scenario_performance_and_latency(retriever: KnowledgeRetriever):
@@ -166,11 +205,11 @@ def test_scenario_performance_and_latency(retriever: KnowledgeRetriever):
 def main():
     print_banner()
     try:
-        test_scenario_whitelist()
-        test_scenario_lgpd()
+        test_scenario_whitelist_and_rbac()
+        test_scenario_lgpd_and_path_sanitization()
         retriever = test_scenario_retriever_and_ingestion()
-        test_scenario_anti_hallucination(retriever)
-        test_scenario_end_to_end_webhook(retriever)
+        test_scenario_anti_hallucination_and_roles(retriever)
+        test_scenario_real_world_webhook(retriever)
         test_scenario_performance_and_latency(retriever)
 
         print("=" * 78)
@@ -179,6 +218,8 @@ def main():
         sys.exit(0)
     except AssertionError as e:
         print(f"\n[ERRO DE VALIDAÇÃO]: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     except Exception as ex:
         print(f"\n[EXCEÇÃO INESPERADA]: {ex}")

@@ -8,6 +8,7 @@ import os
 import logging
 from typing import List, Optional
 from src.core.config import settings
+from src.core.security import remover_caminhos_locais
 from src.rag.vector_store import (
     DocumentChunk,
     VectorStore,
@@ -52,6 +53,9 @@ class KnowledgeRetriever:
 
             if not content:
                 content = title
+
+            # Higienização de infraestrutura: remove caminhos físicos locais da máquina
+            content = remover_caminhos_locais(content)
 
             # Extração simples de tags por palavras-chave
             tags = [w.lower() for w in re.findall(r"\b[A-Za-zÀ-ÿ]{4,}\b", title)]
