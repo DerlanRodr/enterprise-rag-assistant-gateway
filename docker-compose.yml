@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  # Banco de Dados Vetorial & Multimodelo
+  surrealdb:
+    image: surrealdb/surrealdb:v2.0.4
+    container_name: enterprise-surrealdb
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    command: start --user root --pass root file:/mydata/enterprise.db
+    volumes:
+      - surreal_data:/mydata
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API Gateway & Orquestrador RAG
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: enterprise-rag-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_PORT=8000
+      - SURREAL_URL=ws://surrealdb:8000/rpc
+      - SURREAL_USER=root
+      - SURREAL_PASS=root
+      - SURREAL_NS=enterprise
+      - SURREAL_DB=knowledge_base
+      - AUTHORIZED_CONTACTS=+5511999990001,+5511999990002
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+
+volumes:
+  surreal_data:
+    driver: local

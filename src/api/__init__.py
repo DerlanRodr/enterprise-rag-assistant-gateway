@@ -1,0 +1,3 @@
+"""
+Módulo API REST FastAPI.
+"""
